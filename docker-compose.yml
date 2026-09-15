@@ -1,0 +1,15 @@
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: tastyrescue
+    ports:
+      - "5432:5432"
+    volumes:
+      - tastyrescue_pgdata:/var/lib/postgresql/data
+
+volumes:
+  tastyrescue_pgdata:

@@ -1,0 +1,4 @@
+SQLAlchemy==2.0.53
+psycopg2-binary==2.9.13
+python-dotenv==1.2.2
+Faker==40.39.0

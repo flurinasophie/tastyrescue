@@ -15,7 +15,6 @@ place_order is the interesting one: Offer.quantity_available is a shared
 counter that many concurrent customers race to decrement. This is exactly
 the "account balance" pattern from Lecture 05 (Isolation) - see ADR.md.
 """
-import time
 import uuid
 
 from sqlalchemy import text
@@ -61,7 +60,7 @@ def post_offer(session: Session, store_id: int, description: str, price_original
 # 3. Place an order - UNSAFE version (for Task 02.6.1: demonstrate the anomaly)
 # ---------------------------------------------------------------------------
 def place_order_unsafe(session: Session, user_id: int, offer_id: int, quantity: int = 1,
-                        inject_delay: float = 0.0) -> Order:
+                        sync=None) -> Order:
     """
     Classic read-before-write antipattern (see Lecture 05, slide "ANTIPATTERN:
     READ BEFORE WRITE"): SELECT the current quantity in Python, decide in
@@ -69,16 +68,17 @@ def place_order_unsafe(session: Session, user_id: int, offer_id: int, quantity: 
     concurrent transactions can both read the same quantity_available before
     either commits its UPDATE -> lost update / overselling.
 
-    `inject_delay` sleeps between the SELECT and the UPDATE to widen the race
-    window so the anomaly is reproducible on demand instead of only under
-    real load. The bug itself (no locking, no atomic WHERE guard) is real;
-    the sleep only makes an inherently timing-dependent bug deterministic
-    for grading. See ADR.md.
+    `sync` is an optional zero-argument callable invoked between the SELECT and
+    the UPDATE. The isolation test passes a threading.Barrier's wait() so that
+    BOTH transactions are guaranteed to have read before EITHER writes. It does
+    not create the bug - the missing row lock and the missing WHERE guard below
+    are the bug - it only removes the luck from an inherently timing-dependent
+    interleaving that happens on its own under real load. See ADR.md 2.1.
     """
     offer = session.query(Offer).filter(Offer.offer_id == offer_id).one()
 
-    if inject_delay:
-        time.sleep(inject_delay)
+    if sync is not None:
+        sync()
 
     if offer.quantity_available < quantity:
         raise SoldOutError(f"Offer {offer_id} is sold out")

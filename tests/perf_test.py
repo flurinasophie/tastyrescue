@@ -1,44 +1,92 @@
 """
 Task 02.5 - Performance test: predict, then measure.
 
-We load-test `place_order` (the safe version). Before running, we wrote our
-prediction into ADR.md. This script has two modes:
+We load-test `place_order`. The prediction was written into ADR.md and
+committed BEFORE the first run (see git history).
 
-  --mode naive     one DB round-trip per order, one order per commit
-                    (this is what most students write first)
-  --mode batched    same logic, but orders are batched into larger
-                    transactions and we reuse a small connection pool
-                    instead of opening a new connection every time
+Modes:
+  --mode naive     one order = one session = one transaction = one commit.
+                   4 network round-trips per order (pre-ping, UPDATE, INSERT,
+                   COMMIT). This is what the ORM code in src/operations.py does.
+
+  --mode batched   the optimised version: `batch_size` orders are sent as ONE
+                   set-based statement (unnest over arrays -> aggregate per
+                   offer -> UPDATE ... FROM -> INSERT ... SELECT, all in one
+                   CTE) inside ONE transaction. Per batch: ~4 round-trips and
+                   1 commit, instead of 4*batch_size round-trips and
+                   batch_size commits.
+
+  --sync-commit off   additionally disables the WAL fsync wait for that
+                      transaction, to separate "fewer round-trips" from
+                      "fewer disk flushes" in the post-mortem.
 
 Run:
-  python -m tests.perf_test --mode naive   --n 20000
-  python -m tests.perf_test --mode batched --n 20000
+  python -m tests.perf_test --mode naive   --n 300
+  python -m tests.perf_test --mode batched --n 5000 --batch-size 500
 """
 import argparse
 import datetime
 import random
 import time
+import uuid
 
-from sqlalchemy import text
+from sqlalchemy import text, bindparam, ARRAY, Integer, String
 
 from src.db import get_engine, get_session_factory
-from src.models import Store, User, Offer, Order, OrderStatus
+from src.models import Store, User, Offer
 from src.operations import place_order, SoldOutError
 
+# One statement that places `len(offer_ids)` orders.
+#
+#  req  - the batch, unpacked from three parallel arrays into rows
+#  want - how many units this batch wants per offer. We must aggregate,
+#         because a single UPDATE cannot touch the same row twice.
+#  dec  - the atomic check-and-decrement, same guard as place_order():
+#         only offers with enough stock are updated, and only those come back
+#  the INSERT then creates order rows for exactly the offers that succeeded
+BATCH_SQL = text("""
+    WITH req AS (
+        SELECT * FROM unnest(:offer_ids, :user_ids, :codes)
+                      AS t(offer_id, user_id, pickup_code)
+    ),
+    want AS (
+        SELECT offer_id, count(*) AS n FROM req GROUP BY offer_id
+    ),
+    dec AS (
+        UPDATE offers o
+        SET quantity_available = o.quantity_available - want.n
+        FROM want
+        WHERE o.offer_id = want.offer_id
+          AND o.quantity_available >= want.n
+        RETURNING o.offer_id
+    )
+    INSERT INTO orders (user_id, offer_id, quantity, status, pickup_code)
+    SELECT r.user_id, r.offer_id, 1, 'PLACED', r.pickup_code
+    FROM req r JOIN dec d ON d.offer_id = r.offer_id
+""").bindparams(
+    bindparam("offer_ids", type_=ARRAY(Integer)),
+    bindparam("user_ids", type_=ARRAY(Integer)),
+    bindparam("codes", type_=ARRAY(String)),
+)
 
-def seed_offers_for_load_test(session, store_id, n_offers, qty_each=1_000_000):
-    """Offers with huge quantity so we are measuring write throughput, not
-    contention/SoldOutError - contention is what the isolation test covers."""
+
+def seed_offers_for_load_test(n_offers=20, qty_each=10_000_000):
+    """Offers with effectively unlimited stock, so we measure write throughput
+    rather than contention - contention is what the isolation test covers."""
     now = datetime.datetime.now()
-    offers = [
-        Offer(store_id=store_id, description="perf-test bag", price_original=10.0,
-              price_discounted=3.0, quantity_available=qty_each,
-              pickup_from=now, pickup_until=now + datetime.timedelta(hours=2))
-        for _ in range(n_offers)
-    ]
-    session.bulk_save_objects(offers)
-    session.commit()
-    return [o.offer_id for o in session.query(Offer.offer_id).order_by(Offer.offer_id.desc()).limit(n_offers)]
+    engine = get_engine()
+    Session = get_session_factory(engine)
+    with Session() as s:
+        store_id = s.query(Store.store_id).first()[0]
+        offers = [
+            Offer(store_id=store_id, description="perf-test bag", price_original=10.0,
+                  price_discounted=3.0, quantity_available=qty_each,
+                  pickup_from=now, pickup_until=now + datetime.timedelta(hours=2))
+            for _ in range(n_offers)
+        ]
+        s.add_all(offers)
+        s.commit()
+        return [o.offer_id for o in offers]
 
 
 def run_naive(n, user_ids, offer_ids):
@@ -47,7 +95,7 @@ def run_naive(n, user_ids, offer_ids):
     Session = get_session_factory(engine)
 
     start = time.perf_counter()
-    for i in range(n):
+    for _ in range(n):
         session = Session()
         try:
             place_order(session, random.choice(user_ids), random.choice(offer_ids), quantity=1)
@@ -55,18 +103,11 @@ def run_naive(n, user_ids, offer_ids):
             pass
         finally:
             session.close()
-    elapsed = time.perf_counter() - start
-    return elapsed
+    return time.perf_counter() - start
 
 
-def run_batched(n, user_ids, offer_ids, batch_size=500):
-    """The '10x faster' version. Same atomic UPDATE-then-INSERT logic as
-    place_order(), but many orders share ONE transaction / ONE commit
-    instead of committing after every single order. This is the fix that
-    actually matters: Postgres fsyncs the WAL on every COMMIT, so committing
-    once per order means paying that fsync cost n times instead of n/batch_size
-    times."""
-    import uuid
+def run_batched(n, user_ids, offer_ids, batch_size=500, sync_commit="on"):
+    """One statement and one commit per batch."""
     engine = get_engine()
     Session = get_session_factory(engine)
 
@@ -76,67 +117,50 @@ def run_batched(n, user_ids, offer_ids, batch_size=500):
         this_batch = min(batch_size, n - done)
         session = Session()
         try:
-            # Lecture 02 (ACID/Durability): synchronous_commit=off still writes
-            # to the WAL (crash-safe against a process crash), it just doesn't
-            # block the client on the fsync to disk before returning - trading
-            # "durable against an OS/power failure in the last few ms" for
-            # throughput. Scoped to this session only, not a superuser change.
-            session.execute(text("SET LOCAL synchronous_commit = off"))
-            # ONE round-trip per order instead of two: the UPDATE and the
-            # INSERT are fused into a single statement with a CTE, so the
-            # atomic check-and-decrement and the order row are written in
-            # one server round-trip. rows_written = 0 means "sold out".
-            rows = []
-            for _ in range(this_batch):
-                offer_id = random.choice(offer_ids)
-                rows.append({"offer_id": offer_id, "user_id": random.choice(user_ids),
-                             "pickup_code": str(uuid.uuid4())[:8]})
-            # executemany-style: psycopg2 pipelines these far more efficiently
-            # than this_batch separate session.execute() calls.
-            session.execute(
-                text("""
-                    WITH dec AS (
-                        UPDATE offers SET quantity_available = quantity_available - 1
-                        WHERE offer_id = :offer_id AND quantity_available >= 1
-                        RETURNING offer_id
-                    )
-                    INSERT INTO orders (user_id, offer_id, quantity, status, pickup_code)
-                    SELECT :user_id, offer_id, 1, 'PLACED', :pickup_code FROM dec
-                """),
-                rows,
-            )
-            session.commit()  # ONE commit for the whole batch
+            if sync_commit == "off":
+                # Lecture 02 (Durability): the transaction is still written to
+                # the WAL, we just do not block the client until it is fsynced.
+                # Trades "durable against OS/power loss in the last few ms" for
+                # throughput. SET LOCAL = this transaction only.
+                session.execute(text("SET LOCAL synchronous_commit = off"))
+            session.execute(BATCH_SQL, {
+                "offer_ids": [random.choice(offer_ids) for _ in range(this_batch)],
+                "user_ids": [random.choice(user_ids) for _ in range(this_batch)],
+                "codes": [uuid.uuid4().hex[:8] for _ in range(this_batch)],
+            })
+            session.commit()
         finally:
             session.close()
         done += this_batch
-    elapsed = time.perf_counter() - start
-    return elapsed
+    return time.perf_counter() - start
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["naive", "batched"], required=True)
-    parser.add_argument("--n", type=int, default=20000)
+    parser.add_argument("--n", type=int, default=5000)
     parser.add_argument("--batch-size", type=int, default=500)
+    parser.add_argument("--sync-commit", choices=["on", "off"], default="on")
     args = parser.parse_args()
 
     engine = get_engine()
     Session = get_session_factory(engine)
-    session = Session()
-    store = session.query(Store).first()
-    user_ids = [u.user_id for u in session.query(User).limit(300).all()]
-    print(f"Seeding offers with effectively unlimited stock for the load test...")
-    offer_ids = seed_offers_for_load_test(session, store.store_id, n_offers=20)
-    session.close()
+    with Session() as s:
+        user_ids = [u.user_id for u in s.query(User.user_id).limit(300).all()]
+    offer_ids = seed_offers_for_load_test()
 
-    print(f"Running mode={args.mode}, n={args.n} orders...")
+    label = f"mode={args.mode}, n={args.n}"
+    if args.mode == "batched":
+        label += f", batch_size={args.batch_size}, synchronous_commit={args.sync_commit}"
+    print(f"Running {label} ...")
+
     if args.mode == "naive":
         elapsed = run_naive(args.n, user_ids, offer_ids)
     else:
-        elapsed = run_batched(args.n, user_ids, offer_ids, batch_size=args.batch_size)
+        elapsed = run_batched(args.n, user_ids, offer_ids,
+                              batch_size=args.batch_size, sync_commit=args.sync_commit)
 
-    rps = args.n / elapsed
-    print(f"\nRESULT mode={args.mode}: {args.n} orders in {elapsed:.2f}s -> {rps:.1f} orders/sec")
+    print(f"RESULT {label}: {args.n} orders in {elapsed:.2f}s -> {args.n / elapsed:.1f} orders/sec")
 
 
 if __name__ == "__main__":

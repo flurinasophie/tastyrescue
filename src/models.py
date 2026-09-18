@@ -63,6 +63,12 @@ class Offer(Base):
     pickup_from = Column(DateTime)
     pickup_until = Column(DateTime, index=True)  # queried a lot: "bags closing soon"
 
+    # Deliberate: this guard does NOT catch the lost update in Task 02.6 - the
+    # counter never goes negative there, it just stops too early. See ADR 2.1.
+    __table_args__ = (
+        CheckConstraint("quantity_available >= 0", name="ck_offer_qty_non_negative"),
+    )
+
     store = relationship("Store", back_populates="offers")
     orders = relationship("Order", back_populates="offer")
 

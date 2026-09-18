@@ -5,8 +5,16 @@
 > first. Every number in this file must come from our own runs.
 
 Environment: shared course PostgreSQL on AWS RDS (ap-southeast-1, Singapore),
-our tables in schema `tastyrescue`. Client: _(whose laptop, which network,
-Bangkok/other)_. Server version (from `python -m src.db`): _..._
+our tables in schema `tastyrescue`. Client: MacBook in Bangkok (GMT+7), normal
+WiFi, connecting over the public internet to Singapore. Server version
+(`show server_version`): **18.3**.
+
+Measured before predicting (this is input to the prediction, not the test):
+
+```
+SELECT 1 round-trip: median 32.2 ms, min 30.7, max 108.1
+BEGIN + SELECT + COMMIT through the pool: median 132.6 ms  (~4 round-trips)
+```
 
 ---
 
@@ -14,15 +22,46 @@ Bangkok/other)_. Server version (from `python -m src.db`): _..._
 
 ### 1.1 Prediction (written before running anything)
 
-- **Expected throughput, naive mode:** _... orders/sec_
-- **Reasoning:** _how many network round-trips does one `place_order` need?
-  (pool pre-ping, UPDATE, INSERT, COMMIT) What is the round-trip time from
-  our laptop to the server? (`ping` is blocked on RDS, so estimate it or
-  time `SELECT 1` in a loop.) What does that imply for orders/sec?_
-- **Where we expect the bottleneck:** _network latency? the COMMIT / WAL
-  flush? CPU on the server? index maintenance? row locks? Say which one and
-  why the others matter less._
-- **Expected throughput, batched mode, and why:** _..._
+- **Expected throughput, naive mode: ~8 orders/sec** (we would not be surprised
+  by anything in 6–10).
+- **Reasoning:** one `place_order` is a sequence of *blocking* round-trips from
+  Bangkok to Singapore, and the client waits for each one:
+
+  | step | round-trips |
+  |---|---|
+  | `pool_pre_ping` (`SELECT 1` before handing out the connection) | 1 |
+  | `UPDATE offers … WHERE quantity_available >= 1` | 1 |
+  | `INSERT INTO orders …` | 1 |
+  | `COMMIT` | 1 |
+
+  4 × 32 ms ≈ **128 ms per order → ~7.8 orders/sec**. That matches the 132.6 ms
+  we measured for an empty pooled transaction, which is the same 4 round-trips
+  with no real work in them — i.e. we predict the *work* is free and the
+  *waiting* is everything.
+
+- **Where we expect the bottleneck: network latency (round-trip count), not the
+  database.** Why we think the usual suspects matter less here:
+  - *WAL flush on COMMIT:* an RDS fsync is ~1 ms. It is inside our 32 ms
+    COMMIT round-trip, so it is ~3% of it.
+  - *Server CPU / index maintenance:* the UPDATE is one row found by primary
+    key, the INSERT is one row plus two small indexes. Sub-millisecond.
+  - *Row locks:* the load test spreads orders over 20 offers with effectively
+    unlimited stock, and it is single-threaded, so nothing ever waits on a lock.
+    (Contention is what Task 02.6 measures instead.)
+  - The giveaway: an empty transaction costs the same as a real one. If the
+    server were the bottleneck, it would not.
+
+- **Expected throughput, batched mode: ~2 000–3 500 orders/sec.** A batch of 500
+  is *also* ~4 round-trips (pre-ping, `SET LOCAL`, one set-based statement,
+  COMMIT) ≈ 130 ms, plus server time to actually write 500 rows and a bigger
+  payload to push over the wire. So we expect roughly 500 orders per 150–250 ms.
+  That is a predicted **~300× speedup**, far beyond the required 10×, which is
+  itself the evidence for the claim above: if removing waiting buys 300×, then
+  waiting was ~all of it.
+- **What would falsify this:** if naive came out at, say, 40 orders/sec, our
+  round-trip count would be wrong (e.g. pre-ping not firing per order); if
+  batched plateaued near 200/sec, the server, not the network, would be the
+  real limit.
 
 ### 1.2 Measured: naive (one order = one transaction)
 

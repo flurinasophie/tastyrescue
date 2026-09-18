@@ -1,189 +1,142 @@
-# ADR — TastyRescue Data Model (Part 02)
+# ADR: TastyRescue Data Model (Part 02)
 
-This file documents the decisions and, most importantly, the **predictions**
-required by Task 02.5 and 02.6.3. Numbers below are real measurements from
-running the scripts in this repo against PostgreSQL 16 (schema in
-`src/models.py`), not estimates.
+> Workflow for section 1: fill in 1.1, **commit and push it**, and only then
+> run the load test. The git timestamp is the proof that the prediction came
+> first. Every number in this file must come from our own runs.
+
+Environment: shared course PostgreSQL on AWS RDS (ap-southeast-1, Singapore),
+our tables in schema `tastyrescue`. Client: _(whose laptop, which network,
+Bangkok/other)_. Server version (from `python -m src.db`): _..._
 
 ---
 
-## 1. Performance test — `place_order` (Task 02.5)
+## 1. Performance test: `place_order` (Task 02.5)
 
 ### 1.1 Prediction (written before running anything)
 
-We chose to load-test `place_order` because it is our most-called operation
-(see Part 01: Order is the busiest write path after Offer itself) and it's
-the one with a real correctness constraint (see section 2).
+- **Expected throughput, naive mode:** _... orders/sec_
+- **Reasoning:** _how many network round-trips does one `place_order` need?
+  (pool pre-ping, UPDATE, INSERT, COMMIT) What is the round-trip time from
+  our laptop to the server? (`ping` is blocked on RDS, so estimate it or
+  time `SELECT 1` in a loop.) What does that imply for orders/sec?_
+- **Where we expect the bottleneck:** _network latency? the COMMIT / WAL
+  flush? CPU on the server? index maintenance? row locks? Say which one and
+  why the others matter less._
+- **Expected throughput, batched mode, and why:** _..._
 
-**Before running the naive version, our prediction was:**
-
-- Expected throughput: somewhere around **1,000–3,000 orders/sec** on a
-  single Postgres instance with no tuning. We based this on the fact that
-  `place_order` does 2 round-trips (SELECT-free atomic UPDATE + INSERT) plus
-  one `COMMIT` per call, and a single Postgres connection can usually do a
-  few thousand small commits per second on local SSD-backed storage.
-- **Where we expected the bottleneck to be:** the `COMMIT` itself. Every
-  `COMMIT` in PostgreSQL forces a WAL (write-ahead log) flush to disk before
-  it returns control to the client (Lecture 02 — Durability, WAL section).
-  If we commit once per order, we pay that fsync cost on every single
-  order, which we expected to dominate over the actual `UPDATE`/`INSERT`
-  work.
-
-### 1.2 Measured (naive: one order = one session = one commit)
+### 1.2 Measured: naive (one order = one transaction)
 
 ```
-$ python -m tests.perf_test --mode naive --n 15000
-RESULT mode=naive: 15000 orders in 22.62s -> 663.1 orders/sec
+paste the exact output here (run it 3 times, the server is shared)
 ```
 
-**We were roughly right about the order of magnitude (663 rps), but on the
-low end of our prediction range.** Digging in: this sandbox's Postgres runs
-inside a container without a battery-backed cache, so every fsync is a true
-disk sync — slower than it would be on the shared RDS instance from the
-lecture, which likely benefits from a tuned EBS volume. If you re-run this
-on the course RDS host, expect a higher naive number, but the *shape* of the
-bottleneck (commit-per-order) is the same regardless of hardware.
+Was the prediction right? If not, why not? _..._
 
-### 1.3 Making it 10x faster
+### 1.3 Making it at least 10x faster
 
-We changed exactly two things, both aimed directly at the predicted
-bottleneck:
-
-1. **Batch commits.** Instead of committing after every order, we group
-   1,000 orders into one transaction and call `COMMIT` once per batch. This
-   turns 15,000 fsyncs into 15 fsyncs.
-2. **Batch the SQL itself.** We fused the atomic `UPDATE ... RETURNING` +
-   `INSERT ... SELECT` into a single CTE statement (1 round-trip instead of
-   2 per order), and pass all rows for a batch to `session.execute()` at
-   once so SQLAlchemy/psycopg2 pipeline them instead of doing 1,000
-   separate Python-level round-trips.
+What we changed: all orders of a batch are sent as **one** set-based SQL
+statement (`unnest` over arrays, then `UPDATE ... FROM` + `INSERT ... SELECT`
+in one CTE) inside **one** transaction. Per batch of 500 that turns roughly
+_N_ round-trips and 500 commits into 1 round-trip and 1 commit.
 
 ```
-$ python -m tests.perf_test --mode batched --n 15000 --batch-size 1000
-RESULT mode=batched: 15000 orders in 2.29s -> 6544.6 orders/sec
+paste output of batched runs here (try batch sizes 100, 500, 1000)
 ```
 
-**663 → 6,545 orders/sec = 9.87x faster.** Matches the prediction: once
-commit-per-order (the fsync cost) was removed, throughput jumped by almost
-exactly an order of magnitude, confirming that was indeed the bottleneck
-and not, say, index contention or CPU.
+Explanation of the delta: _which of the removed costs (round-trips vs.
+commits) was responsible for most of the speedup, and how do you know?_
 
-**Trade-off we accepted:** batching means if the process crashes mid-batch,
-up to 999 already-processed orders in that batch are rolled back together
-(they were never committed). For an at-most-a-few-seconds-old batch of
-purchases, we consider that acceptable — the alternative (commit-per-order)
-costs us 10x throughput. In production we'd tune batch size against "how
-many recent orders are we willing to lose/retry on a crash", not push it as
-high as possible.
+Trade-offs we accept:
+- Orders in a batch are committed together, so a crash loses the whole
+  uncommitted batch, and the customer waits until the batch is flushed.
+- Inside one batch, all orders for the same offer succeed or fail together.
+- With several concurrent batch writers, offers must be locked in a fixed
+  order, otherwise deadlocks become possible.
 
 ---
 
-## 2. Isolation test — `place_order` oversell (Task 02.6)
+## 2. Isolation test: overselling the last bag (Task 02.6)
 
-### 2.1 The anomaly: **lost update** (leading to overselling)
+### 2.1 The anomaly: lost update, leading to a double booking
 
-**Operation under test:** `place_order_unsafe` in `src/operations.py` —
-the naive, "obviously correct-looking" implementation: `SELECT`
-`quantity_available`, check it in Python, then `UPDATE` it.
+`place_order_unsafe` reads `quantity_available`, checks it in Python and
+writes back the value Python computed. Two customers, two connections,
+`READ COMMITTED`, offer with 1 bag left:
 
-**Setup:** one Offer with `quantity_available = 1` (a bag with exactly one
-portion left). Two different users, in two independent DB sessions, both
-running at PostgreSQL's default isolation level (`READ COMMITTED`), both
-call `place_order_unsafe` at (almost) the same time.
+| time | Transaction A                       | Transaction B                       |
+|------|-------------------------------------|-------------------------------------|
+| t1   | SELECT qty -> 1                     |                                     |
+| t2   |                                     | SELECT qty -> 1                     |
+| t3   | UPDATE offers SET qty = 0           |                                     |
+| t4   | INSERT order, COMMIT                |                                     |
+| t5   |                                     | UPDATE offers SET qty = 0 (waited for A's lock, then overwrites) |
+| t6   |                                     | INSERT order, COMMIT                |
 
-**What happens (real run, `python -m tests.isolation_test`):**
+Both succeed. B's write overwrites A's decrement: that is the lost update.
+The counter shows a harmless-looking 0, but two orders exist for one bag.
+The CHECK `quantity_available >= 0` does not catch it because the value
+never goes negative.
+
+The test puts a `threading.Barrier` between the SELECT and the UPDATE so that
+t1 and t2 both happen before t3. The barrier does not create the bug, it
+forces an interleaving that happens by chance under real load.
+
+Output of `python -m pytest tests/isolation_test.py -v` and
+`python -m tests.isolation_test`:
 
 ```
-Created offer 804 with quantity_available = 1
-Two users concurrently try to buy 1 unit each (0.3s delay between read and write)...
-Orders successfully placed: 2 -> order_ids [6, 7]
-Orders table row count for this offer: 2
-Offer.quantity_available after both transactions: 0
+paste here
 ```
 
-**The corrupted row:** `offers.offer_id=804` ends with `quantity_available=0`
-— which *looks* perfectly normal (0, not negative) — but there are **2 rows
-in `orders`** referencing it. We sold the same last bag to two different
-paying customers. The counter doesn't even show visible corruption; only
-cross-checking `orders` count against the original `quantity_available`
-reveals it.
+Corrupted rows (query from DBeaver, screenshot optional):
 
-**Why this happens (classic lost update, READ COMMITTED):** both sessions
-`SELECT`ed `quantity_available = 1` before either had committed its
-`UPDATE`. Both then computed `1 - 1 = 0` in Python and both `UPDATE`d the
-row to `0`. Session B's write silently overwrote session A's write with the
-*same* value, hiding the fact that two decrements should have happened. No
-lock was ever taken on the row between the `SELECT` and the `UPDATE`, so
-`READ COMMITTED` (which only guarantees you don't see *uncommitted* data,
-not that the data doesn't change under you) does nothing to prevent this.
-
-We added a small `inject_delay` (0.3s) between the read and the write in
-`place_order_unsafe` purely to widen the race window on demand — the bug
-itself is the same lost-update bug that happens under real concurrent
-load without any delay, just much harder to hit reliably in a short demo.
+```sql
+SELECT f.offer_id, f.quantity_available, o.order_id, o.user_id, o.pickup_code
+FROM tastyrescue.offers f JOIN tastyrescue.orders o USING (offer_id)
+WHERE f.offer_id = <offer_id printed by the test>;
+```
 
 ### 2.2 The fix: atomic conditional UPDATE
-
-`place_order` (the safe version) replaces the read-then-write with a single
-statement:
 
 ```sql
 UPDATE offers
 SET quantity_available = quantity_available - :qty
 WHERE offer_id = :offer_id AND quantity_available >= :qty
+RETURNING offer_id
 ```
 
-The check (`quantity_available >= qty`) and the decrement happen in the
-*same* statement, and PostgreSQL takes a row lock for the duration of that
-`UPDATE`, so a second concurrent `UPDATE` on the same row simply waits, then
-re-evaluates the `WHERE` clause against the *new* value and matches 0 rows.
-We detect that via `rowcount == 0` and raise `SoldOutError` — no explicit
-`SELECT ... FOR UPDATE` needed, because the condition and the write are
-fused.
-
-**Same experiment, safe version:**
-
-```
-Created offer 805 with quantity_available = 1
-Two users concurrently try to buy 1 unit each...
-Orders successfully placed: 1 -> order_ids [8]
-Rejected with SoldOutError: 1 -> ['Offer 805 is sold out']
-Orders table row count for this offer: 1
-Offer.quantity_available after both transactions: 0
-```
-
-Exactly one order succeeds, one is cleanly rejected, `quantity_available`
-never goes negative and never gets oversold.
+Check and decrement are one statement. B's UPDATE blocks on A's row lock;
+when A commits, Postgres (still at READ COMMITTED) re-evaluates B's WHERE
+clause against the new row version, finds `0 >= 1` false, and updates
+nothing. B gets `SoldOutError`. Same test, now passing: _paste output_.
 
 ### 2.3 What the fix cost us
 
-- **No throughput cost under low contention:** for offers with plenty of
-  stock (the common case — see the perf test, which uses this same safe
-  `place_order`), the extra `WHERE` clause costs nothing measurable; it's
-  the same single `UPDATE` statement either way.
-- **Under high contention on the same row** (many customers racing for the
-  last few units of one popular bag), losers now get an immediate,
-  well-defined `SoldOutError` on their *first* attempt instead of silently
-  succeeding-but-wrong. That's a UX cost we have to design around (show
-  "sold out, refresh" in the app) rather than a performance cost.
-- **We deliberately did *not* reach for `SELECT ... FOR UPDATE` +
-  `SERIALIZABLE`.** That would also fix it, but it holds a lock across two
-  round-trips (SELECT, then UPDATE) instead of one, which is a wider window
-  for other transactions to queue up behind it, and it introduces a real
-  deadlock risk if the same code ever locks two offers in inconsistent
-  order in a single transaction (see Lecture 05, "DEADLOCK" slides). The
-  atomic conditional `UPDATE` gets the same correctness guarantee with a
-  single, non-blocking-for-others statement, so we prefer it here.
+- **Lock waits:** buyers of the same offer are serialised on its row lock
+  until the holder commits. The longer the transaction after the UPDATE
+  (INSERT, COMMIT, network), the longer others wait. _(optional: measure
+  with many threads on one offer)_
+- **Failures become visible:** the loser gets `SoldOutError` and the app
+  must handle it ("sold out"). No retries needed, unlike `SERIALIZABLE`.
+- **Alternatives considered:**
+  - `SELECT ... FOR UPDATE`: also correct, but holds the lock across an
+    extra round-trip, and locking several offers in different orders can
+    deadlock.
+  - `REPEATABLE READ` / `SERIALIZABLE`: B aborts with a serialization
+    error (40001), so we would need retry logic and waste work under
+    contention.
+- **Remaining risk:** the conditional UPDATE only protects this one
+  counter. Any new code path that writes `quantity_available` with
+  read-then-write reintroduces the bug.
 
 ---
 
-## 3. Environment note
+## 3. Index decisions
 
-All numbers above come from PostgreSQL 16 running locally (see
-`docker-compose.yml`), not the shared course RDS instance from the lecture
-slides — we didn't want three team members hammering a shared 100k-row
-database with a 15,000-order load test. The *relative* speedup (9.87x) and
-the *anomaly itself* (lost update under READ COMMITTED) are properties of
-PostgreSQL's isolation model, not of this specific machine, so they should
-reproduce the same way against the RDS instance if you want to re-run there
-for the viva.
+| Column | Indexed? | Why |
+|---|---|---|
+| all `*_id` primary keys | yes (automatic) | lookups by id, used by every operation |
+| `users.email`, `payments.order_id`, `reviews.order_id`, `orders.pickup_code` | yes (UNIQUE) | business rules; the index comes with the constraint |
+| `offers.store_id`, `orders.user_id`, `orders.offer_id` | yes (explicit) | Postgres does NOT index foreign keys automatically; needed for "offers of a store", "my orders", counting orders per offer, and FK checks on delete |
+| `offers.pickup_until` | yes | "bags closing soon" query |
+| `reviews.comment`, `offers.description` | no | never filtered on; an index would only slow down writes |

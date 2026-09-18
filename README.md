@@ -18,16 +18,11 @@ Werne, Annabel von Morgenstern.
 
 ### 1. Get a PostgreSQL database
 
-Either use the shared course RDS instance from the Lecture 05 slides, **or**
-run Postgres locally with Docker (recommended for the load test / isolation
-test so you're not hammering a shared database):
+We use the shared course RDS instance (see `.env.example`). All our tables
+live in the schema `tastyrescue`, so we never collide with other teams.
 
-```bash
-docker compose up -d
-```
-
-This starts Postgres 16 on `localhost:5432` with user/password/db all set
-to match `.env.example`.
+Optional local database: `docker compose up -d` starts Postgres 16 on
+`localhost:5434` (user/password `postgres`, database `tastyrescue`).
 
 ### 2. Python environment
 
@@ -40,14 +35,14 @@ pip install -r requirements.txt
 ### 3. Configure the connection
 
 ```bash
-cp .env.example .env
-# edit .env if you're pointing at the shared RDS instance instead of local docker
+cp .env.example .env      # then put the class password into .env
+python -m src.db          # connectivity check
 ```
 
 ### 4. Create tables and load sample data
 
 ```bash
-python -m src.create_tables
+python -m src.create_tables --reset
 python -m src.populate --stores 200 --users 2000 --offers 5000
 ```
 
@@ -59,10 +54,11 @@ python -m tests.test_operations
 
 # Task 02.6 — the isolation anomaly, then the fix
 python -m tests.isolation_test
+python -m pytest tests/isolation_test.py -v   # 6.1 FAILED, 6.2 PASSED
 
 # Task 02.5 — performance: naive vs. 10x-optimized
-python -m tests.perf_test --mode naive   --n 15000
-python -m tests.perf_test --mode batched --n 15000 --batch-size 1000
+python -m tests.perf_test --mode naive   --n 1000
+python -m tests.perf_test --mode batched --n 1000 --batch-size 500
 ```
 
 Read `ADR.md` for what these numbers mean and what we predicted beforehand.

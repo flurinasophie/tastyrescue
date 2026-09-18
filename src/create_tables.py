@@ -7,7 +7,7 @@ from src.models import Base
 
 
 def create_all(drop_first: bool = False):
-    engine = get_engine()
+    engine = get_engine(True)
     if drop_first:
         Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)

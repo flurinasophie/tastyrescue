@@ -23,6 +23,8 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "HSBCN323TestDb36111")
 DB_HOST = os.getenv("DB_HOST", "database-1.c32ikym4q9dx.ap-southeast-1.rds.amazonaws.com")
 DB_PORT = os.getenv("DB_PORT", "5432")
 DB_NAME = os.getenv("DB_NAME", "postgres")
+# All our tables live in this schema, so we never touch other teams' tables
+DB_SCHEMA = os.getenv("DB_SCHEMA", "tastyrescue")
 
 DATABASE_URL = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
@@ -36,6 +38,7 @@ def get_engine(echo: bool = False):
         pool_size=10,
         max_overflow=20,
         pool_pre_ping=True,
+        connect_args={"options": f"-csearch_path={DB_SCHEMA}"},
     )
 
 

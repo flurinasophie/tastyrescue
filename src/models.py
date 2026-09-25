@@ -62,6 +62,10 @@ class Offer(Base):
     quantity_available = Column(Integer, nullable=False)
     pickup_from = Column(DateTime)
     pickup_until = Column(DateTime, index=True)  # queried a lot: "bags closing soon"
+    # Part 03: how often the detail page was opened. In the SQL workload this
+    # is a hot-row counter every viewer fights over; in the Redis workload it
+    # lives in Redis and is flushed back here in batches.
+    view_count = Column(Integer, nullable=False, server_default="0")
 
     # Deliberate: this guard does NOT catch the lost update in Task 02.6 - the
     # counter never goes negative there, it just stops too early. See ADR 2.1.
@@ -89,6 +93,26 @@ class Order(Base):
     offer = relationship("Offer", back_populates="orders")
     payment = relationship("Payment", back_populates="order", uselist=False)
     review = relationship("Review", back_populates="order", uselist=False)
+
+
+class OfferView(Base):
+    """Part 03: one row per opened detail page.
+
+    This is the entity we move to Redis. It is the highest-volume thing in the
+    product (every customer browses many bags before reserving one) and the
+    cheapest one to lose - see ADR.md section 5.
+    """
+    __tablename__ = "offer_views"
+
+    view_id = Column(Integer, primary_key=True)
+    offer_id = Column(Integer, ForeignKey("offers.offer_id"), nullable=False, index=True)
+    # Nullable on purpose: anonymous browsing is allowed, and we do not want a
+    # login to be a precondition for looking at a bag.
+    user_id = Column(Integer, ForeignKey("users.user_id"))
+    viewed_at = Column(DateTime, server_default=func.now())
+    # Which path wrote this row: 'sql' (synchronous) or 'redis' (flushed from
+    # the stream). Lets us tell the two workloads apart in one table.
+    source = Column(String(10), nullable=False, server_default="sql")
 
 
 class Payment(Base):

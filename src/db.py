@@ -28,12 +28,31 @@ DB_SCHEMA = os.getenv("DB_SCHEMA", "tastyrescue")
 
 DATABASE_URL = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
+# Part 03: the same Postgres, but on this machine (docker compose up -d db).
+# Having both lets us separate "Redis is a different engine" from "Redis is in
+# the same room" when we compare - see ADR.md section 3.
+LOCAL_DATABASE_URL = os.getenv(
+    "LOCAL_DATABASE_URL", "postgresql+psycopg2://postgres:postgres@localhost:5434/tastyrescue"
+)
+# "rds" (shared course server in Singapore) or "local" (docker on this machine)
+DB_TARGET = os.getenv("DB_TARGET", "rds")
+
 print("DB connection URL:", DATABASE_URL.replace(DB_PASSWORD, "***"))
 
-def get_engine(echo: bool = False):
+
+def database_url(target: str | None = None) -> str:
+    target = (target or DB_TARGET).lower()
+    if target == "local":
+        return LOCAL_DATABASE_URL
+    if target == "rds":
+        return DATABASE_URL
+    raise ValueError(f"unknown DB target {target!r}, expected 'rds' or 'local'")
+
+
+def get_engine(echo: bool = False, target: str | None = None):
     """One engine per process. pool_size/max_overflow matter for the perf test."""
     return create_engine(
-        DATABASE_URL,
+        database_url(target),
         echo=echo,
         pool_size=10,
         max_overflow=20,

@@ -70,3 +70,45 @@ Keep `--n` small for naive: at ~5 orders/sec over the internet, 1 000 orders
 would take 3.5 minutes of pure waiting.
 
 Read `ADR.md` for what these numbers mean and what we predicted beforehand.
+
+## Part 03 — Redis for the view counter
+
+The workload is "a customer opens a bag's detail page": read the offer, count
+the view, record the event (`src/views.py`). Part 03 runs that sequence against
+Postgres and against Redis, and then shows what the Redis version costs us.
+
+```bash
+docker compose up -d                  # Postgres on :5434 AND Redis on :6379
+python -m src.migrate_part03          # adds offers.view_count + offer_views
+python -m src.migrate_part03 --db local
+python -m src.cache                   # Redis connectivity check
+```
+
+```bash
+# Task 03.1 — how fast can Redis take new records at all?
+python -m tests.perf_nosql --mode naive    --n 20000
+python -m tests.perf_nosql --mode pipeline --n 200000 --batch 1000
+python -m tests.perf_nosql --mode pipeline --n 500000 --batch 1000 --threads 8
+
+# Task 03.2 — the same sequence in Postgres, remote and local
+python -m tests.perf_sequence --backend sql --db rds   --n 300 --profile
+python -m tests.perf_sequence --backend sql --db local --n 2000
+
+# Task 03.3 — the sequence in Redis
+python -m tests.perf_sequence --backend redis --n 50000
+python -m tests.perf_sequence --backend redis --n 200000 --threads 8
+
+# ... and what Postgres still has to do afterwards (the deferred work)
+python -m tests.perf_sequence --backend flush --db local
+
+# the hot row: everyone viewing the SAME bag (--offers 1)
+python -m tests.perf_sequence --backend sql --db rds --n 240 --threads 8 --offers 1
+
+# Task 03.4 — what we gave up: lost views, a dirty counter, a stale read,
+# and duplicates. These tests PASS when the damage is reproduced.
+python -m pytest tests/consistency_test.py -v -s
+```
+
+Local Postgres is measured on purpose: Redis runs on this machine, so comparing
+it only against RDS in Singapore would measure the network, not the databases.
+`ADR.md` section 03 keeps those two effects apart.

@@ -1,4 +1,6 @@
 services:
+  # Local Postgres. Part 03 uses it as the "same machine" leg of the
+  # comparison, so we can tell network latency apart from engine cost.
   db:
     image: postgres:16
     restart: unless-stopped
@@ -11,5 +13,19 @@ services:
     volumes:
       - tastyrescue_pgdata:/var/lib/postgresql/data
 
+  # Part 03: the NoSQL store for the view counter / offer cache / view stream.
+  # appendfsync everysec is Redis' default durability: a crash can lose up to
+  # one second of writes. That is not an accident here, it is the trade-off we
+  # demonstrate in tests/consistency_test.py and justify in ADR.md section 4.
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - tastyrescue_redisdata:/data
+
 volumes:
   tastyrescue_pgdata:
+  tastyrescue_redisdata:
